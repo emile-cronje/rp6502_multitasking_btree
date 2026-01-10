@@ -43,7 +43,6 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 set(C_SOURCES
   ${OS_SRC_DIR}/main.c
   ${OS_SRC_DIR}/scheduler.c
-  ${OS_SRC_DIR}/ringq.c
   ${OS_SRC_DIR}/pubsub.c
   ${OS_SRC_DIR}/string_helpers.c
 )

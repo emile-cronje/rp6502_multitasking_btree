@@ -1,5 +1,6 @@
 #include "scheduler.h"
 #include "pubsub.h"
+#include "btree.h"
 #include <stddef.h> /* For NULL */
 #include <stdlib.h> /* For malloc and free */
 #include <ctype.h>  /* For isprint */
@@ -9,20 +10,8 @@
 
 /* Configuration flags - must come before conditional includes */
 #define USE_PUBSUB_BTREE_ONLY 1
-#define TEST_MSG_LENGTH 1
-#define TCP_TEST_MSG_COUNT 1
-#define TCP_TEST_MSG_LENGTH 2
-#define TCP_BATCH_SIZE 10
-#define RESPONSE_BUFFER_SIZE 256
-#define COMMAND_TIMEOUT 10000
-
-const unsigned int BATCH_SIZE = 500;    
-const unsigned int MAX_ITEM_COUNT = 2000;    
-volatile unsigned char mq_lock = 0;
 
 /* Move declarations to the top of the file */
-static unsigned char mem_fluctuate_active = 0;
-static unsigned char mem_fluctuate_buffer[64];
 static unsigned int _count1 = 0;
 static unsigned int _count2 = 0;
 static unsigned int _count3 = 0;
@@ -35,7 +24,6 @@ static unsigned int _count3 = 0;
 #include <string.h>
 #include <stdarg.h>
 #include "string_helpers.h"
-#include "ringq.h"
 
 volatile unsigned int sleep_ms = 250;
 volatile unsigned int sleep_ms_short = 10;
@@ -133,16 +121,6 @@ static char* my_strstr(const char *haystack, const char *needle)
     return NULL;
 }
 
-void xram_strcpy(unsigned int addr, const char* str) {
-    int i;
-    RIA.step0 = 1;  // Enable auto-increment
-    RIA.addr0 = addr;
-    for (i = 0; str[i]; i++) {
-        RIA.rw0 = str[i];
-    }
-    RIA.rw0 = 0;
-}
-
 /* Simple sprintf for specific format strings */
 static void my_sprintf(char *dest, const char *fmt, const char *s1, const char *s2)
 {
@@ -162,14 +140,6 @@ static void my_sprintf(char *dest, const char *fmt, const char *s1, const char *
         }
     }
     *dest = '\0';
-}
-
-/* Simple print function */
-static void tcp_print(char *s)
-{
-    while (*s)
-        if (RIA.ready & RIA_READY_TX_BIT)
-            RIA.tx = *s++;
 }
 
 /* Simple delay function */
@@ -239,21 +209,227 @@ static void on_rp6502(const char *topic, const PubSubMessage *message, void *use
 }
 
 #if USE_PUBSUB_BTREE_ONLY == 1
+/* B-tree instance for storing consumed messages from main topics */
+static BTree *g_consumer_btree = NULL;
+static unsigned int g_btree_insert_count = 0;
+
+/* Separate B-tree instance for test items */
+static BTree *g_test_btree = NULL;
+
 static void on_rp6502_btree(const char *topic, const PubSubMessage *message, void *user_data)
 {
-    unsigned int storage_index;
+    unsigned int key;
     
-    if (message_storage_count >= MESSAGE_STORAGE_SIZE)
-        return;  /* Storage full */
+    /* Ensure btree is initialized */
+    if (g_consumer_btree == NULL) {
+        g_consumer_btree = btree_create();
+        if (g_consumer_btree == NULL) {
+            printf("[BTREE_SUBSCRIBER] FAILED to create btree\n");
+            return;
+        }
+    }
     
-    /* Store the message value in the simple storage array */
-    storage_index = message_storage_count++;
-    message_storage[storage_index] = message->value;
+    /* Use a unique key for each inserted message (use message key and a counter) */
+    key = (message->key << 16) | (g_btree_insert_count & 0xFFFF);
     
-    printf("[BTREE_SUBSCRIBER] Received on topic '%s': key=%d, stored_index=%u, value=%p\n",
-           topic, message->key, storage_index, message->value);
+    /* Insert the message value into the btree */
+    btree_insert(g_consumer_btree, key, message->value);
+    g_btree_insert_count++;
     
+    /* Check if this is a string message (from rp6502_pub_3 with JSON) or numeric (from pub_1/pub_2) */
+    if (is_likely_string(message->value)) {
+        printf("[BTREE_SUBSCRIBER] Received on topic '%s': key=%d, text=%s, stored_in_btree with key=%u\n",
+               topic, message->key, (const char *)message->value, key);
+    } else {
+        unsigned long numeric = (unsigned long)message->value;
+        printf("[BTREE_SUBSCRIBER] Received on topic '%s': key=%d, value=%lu, stored_in_btree with key=%u\n",
+               topic, message->key, numeric, key);
+    }
+
     (void)user_data;
+}
+#endif
+
+/* ========== Test Producer/Validator Tasks for BTree ========== */
+
+#if USE_PUBSUB_BTREE_ONLY == 1
+/* Test items to be produced and validated */
+#define TEST_ITEM_COUNT 50
+static unsigned int test_items[TEST_ITEM_COUNT];
+static unsigned int test_items_produced = 0;
+static unsigned int test_items_consumed = 0;
+static unsigned char test_validation_complete = 0;
+
+/* Producer task: sends test items to a special topic */
+static void test_producer_task(void *arg)
+{
+    static unsigned int producer_index = 0;
+    PubSubMessage msg;
+    
+    (void)arg;
+    
+    if (producer_index == 0) {
+        printf("[TEST_PRODUCER] Starting producer with %u test items\n", TEST_ITEM_COUNT);
+    }
+    
+    /* Infinite loop publishing items until all are sent */
+    while (producer_index < TEST_ITEM_COUNT) {
+        msg.key = producer_index;
+        msg.value = (void *)(unsigned long)test_items[producer_index];
+        
+        if (pubsub_publish(&g_pubsub_mgr, "test_items", &msg)) {
+            printf("[TEST_PRODUCER] Published item %u: key=%u, value=%u\n", 
+                   producer_index, msg.key, test_items[producer_index]);
+            test_items_produced++;
+        } else {
+            printf("[TEST_PRODUCER] FAILED to publish item %u\n", producer_index);
+        }
+        producer_index++;
+        scheduler_sleep(50);
+    }
+    
+    printf("[TEST_PRODUCER] All %u items sent\n", test_items_produced);
+    
+    /* Keep task alive after sending all items */
+    while (!test_validation_complete) {
+        scheduler_sleep(100);
+    }
+}
+
+/* Consumer callback for test items */
+static void test_item_consumer(const char *topic, const PubSubMessage *message, void *user_data)
+{
+    unsigned int key;
+    
+    /* Ensure test btree is initialized */
+    if (g_test_btree == NULL) {
+        g_test_btree = btree_create();
+    }
+    
+    if (g_test_btree == NULL) {
+        printf("[TEST_CONSUMER] FAILED to create test btree\n");
+        return;
+    }
+    
+    /* Use message key as the btree key */
+    key = message->key;
+    
+    /* Insert the message value into the test btree */
+    btree_insert(g_test_btree, key, message->value);
+    test_items_consumed++;
+    
+    printf("[TEST_CONSUMER] Consumed item: key=%u, value=%lu\n",
+           key, (unsigned long)message->value);
+    
+    (void)topic;
+    (void)user_data;
+}
+
+/* Validator task: checks all sent items are in the btree */
+static void test_validator_task(void *arg)
+{
+    static unsigned int validation_index = 0;
+    static unsigned int validation_passed = 0;
+    static unsigned int validation_failed = 0;
+    static unsigned int validator_phase = 0;  /* 0=waiting, 1=validating, 2=done */
+    void *retrieved_value;
+    unsigned long expected;
+    
+    (void)arg;
+    
+    if (validation_index == 0 && validator_phase == 0) {
+        printf("[TEST_VALIDATOR] Starting validator task\n");
+        printf("[TEST_VALIDATOR] Waiting for all %u items to be consumed...\n", TEST_ITEM_COUNT);
+    }
+    
+    /* Infinite loop with phases */
+    while (1) {
+        /* Phase 0: Wait for all items to be consumed */
+        if (validator_phase == 0) {
+            printf("[TEST_VALIDATOR] Progress: %u/%u consumed\n", 
+                   test_items_consumed, TEST_ITEM_COUNT);
+            
+            if (test_items_consumed >= TEST_ITEM_COUNT) {
+                printf("[TEST_VALIDATOR] All items consumed, validating...\n");
+                validator_phase = 1;
+                validation_index = 0;
+            } else {
+                scheduler_sleep(200);
+            }
+        }
+        /* Phase 1: Validate items one per invocation */
+        else if (validator_phase == 1) {
+            if (validation_index < TEST_ITEM_COUNT) {
+                if (g_test_btree != NULL) {
+                    expected = (unsigned long)test_items[validation_index];
+                    retrieved_value = btree_get(g_test_btree, validation_index);
+                    
+                    if (retrieved_value == (void *)expected) {
+                        printf("[TEST_VALIDATOR] PASS: item[%u] = %lu (found in btree)\n", 
+                               validation_index, expected);
+                        validation_passed++;
+                    } else {
+                        printf("[TEST_VALIDATOR] FAIL: item[%u] = %lu (got %p from btree)\n", 
+                               validation_index, expected, retrieved_value);
+                        validation_failed++;
+                    }
+                } else {
+                    printf("[TEST_VALIDATOR] ERROR: test btree is NULL\n");
+                    validator_phase = 2;
+                }
+                validation_index++;
+                scheduler_sleep(50);
+            } else {
+                /* All items validated, move to phase 2 */
+                validator_phase = 2;
+            }
+        }
+        /* Phase 2: Print summary and complete */
+        else if (validator_phase == 2) {
+            printf("[TEST_VALIDATOR] ========== VALIDATION SUMMARY ==========\n");
+            printf("[TEST_VALIDATOR] Total items sent:     %u\n", TEST_ITEM_COUNT);
+            printf("[TEST_VALIDATOR] Total items consumed: %u\n", test_items_consumed);
+            printf("[TEST_VALIDATOR] Validation passed:    %u/%u\n", validation_passed, TEST_ITEM_COUNT);
+            printf("[TEST_VALIDATOR] Validation failed:    %u/%u\n", validation_failed, TEST_ITEM_COUNT);
+            
+            if (validation_failed == 0) {
+                printf("[TEST_VALIDATOR] ========== ALL VALIDATIONS PASSED! ==========\n");
+            } else {
+                printf("[TEST_VALIDATOR] ========== VALIDATION ERRORS DETECTED ==========\n");
+            }
+            
+            test_validation_complete = 1;
+            validator_phase = 3;  /* Mark as fully done */
+        }
+        /* Phase 3: Keep running but do nothing */
+        else {
+            scheduler_sleep(100);
+            break;  /* Exit the loop but not the function - will be called again */
+        }
+    }
+}
+
+/* Cleanup task: waits for validation to complete and halts the system */
+static void test_cleanup_task(void *arg)
+{
+    (void)arg;
+    
+    printf("[CLEANUP] Waiting for validation to complete...\n");
+    
+    while (!test_validation_complete) {
+        scheduler_sleep(100);
+    }
+    
+    printf("[CLEANUP] Validation complete! All tests finished.\n");
+    printf("[CLEANUP] Halting system...\n");
+    scheduler_sleep(500);
+    
+    /* Halt the system by disabling interrupts and entering infinite loop */
+#if defined(__CC65__)
+    __asm__("sei");
+#endif
+    
+    for (;;) { /* halt */ }
 }
 #endif
 
@@ -321,6 +497,12 @@ static void pubsub_monitor(void *arg)
     printf("[MONITOR] Starting pubsub monitor task\n");
     
     for (;;) {
+        /* Check if validation is complete */
+        if (test_validation_complete) {
+            printf("[MONITOR] Validation complete, exiting monitor task\n");
+            break;
+        }
+        
         printf("[MONITOR] Queue sizes:");
 
         if (g_pubsub_mgr.topic_count == 0) {
@@ -382,6 +564,12 @@ static void pubsub_publish_task(void *arg)
     printf("[MONITOR] Starting pubsub publish task\n");
     
     for (;;) {
+        /* Check if validation is complete */
+        if (test_validation_complete) {
+            printf("[PUBLISH_TASK] Validation complete, exiting publish task\n");
+            break;
+        }
+        
         /* Publish to rp6502_pub_1 */
         msg = pubsub_make_message(1, (void *)(unsigned long)_count1);
         pubsub_publish(&g_pubsub_mgr, "rp6502_pub_1", &msg);
@@ -405,123 +593,9 @@ static void pubsub_publish_task(void *arg)
     }
 }
 
-/* Queue test: producer/consumer pair that use their own RingQ instance to
-   send a random number of items (1000-10000 per run) and verify that all
-   items were received. */
-static RingQ test_q_2;
-volatile unsigned int test_sent_count = 0;
-volatile unsigned int test_recv_count = 0;
-volatile unsigned int test_producer_done = 0;
-volatile unsigned int test_total_item_count = 0;
-volatile unsigned int test_start_ticks = 0;
-volatile unsigned int test_consumer_ready = 0;
-volatile unsigned int test_end_ticks = 0;
-static unsigned int test_time_elapsed_ticks = 0;
-volatile unsigned long test_sent_sum = 0UL;
-volatile unsigned long test_recv_sum = 0UL;
-volatile unsigned int test_run_count = 0;
-
-/* Instrumentation totals for ringq operations (incremented in ringq.c). */
-volatile unsigned long ringq_total_pushed = 0UL;
-volatile unsigned long ringq_total_popped = 0UL;
-
-/* Debug hook invoked from ringq.c on invariant failures. */
-void ringq_debug_fail(const char *msg, unsigned int a, unsigned int b)
-{
-    /* Reuse fail_halt to print extended state and halt */
-    fail_halt(msg, a, b);
-}
-
-/* Sequence instrumentation: monotonic sequence written by producer and
-   recorded by consumer to help detect extra/duplicate pops. */
-volatile unsigned long test_seq = 0UL;
-volatile unsigned int recv_log[64];
-volatile unsigned int recv_log_pos = 0u;
-
-/* Full fail_halt implementation prints extended runtime state then halts. */
-static void fail_halt(const char *msg, unsigned int a, unsigned int b)
-{
-    char numbuf[32];
-    unsigned int tail_idx;
-    unsigned int val_tail;
-    unsigned int prev_idx;
-
-    puts("*** FATAL: "); puts(msg); puts("\r\n");
-
-    puts("args: ");
-    itoa_new(a, numbuf, sizeof(numbuf)); puts(numbuf); puts(" ");
-    itoa_new(b, numbuf, sizeof(numbuf)); puts(numbuf); puts("\r\n");
-
-    puts("run:"); itoa_new(test_run_count, numbuf, sizeof(numbuf)); puts(numbuf); puts(" ");
-    puts("ticks:"); itoa_new(scheduler_get_ticks(), numbuf, sizeof(numbuf)); puts(numbuf); puts("\r\n");
-
-    puts("total_items:"); itoa_new(test_total_item_count, numbuf, sizeof(numbuf)); puts(numbuf); puts(" ");
-    puts("sent_count:"); itoa_new(test_sent_count, numbuf, sizeof(numbuf)); puts(numbuf); puts(" ");
-    puts("recv_count:"); itoa_new(test_recv_count, numbuf, sizeof(numbuf)); puts(numbuf); puts("\r\n");
-
-    puts("sent_sum_lo:"); itoa_new((unsigned int)(test_sent_sum & 0xFFFFu), numbuf, sizeof(numbuf)); puts(numbuf); puts(" ");
-    puts("recv_sum_lo:"); itoa_new((unsigned int)(test_recv_sum & 0xFFFFu), numbuf, sizeof(numbuf)); puts(numbuf); puts("\r\n");
-
-    /* Test queue state */
-    puts("test_q_2 head:"); itoa_new(test_q_2.head, numbuf, sizeof(numbuf)); puts(numbuf); puts(" ");
-    puts("tail:"); itoa_new(test_q_2.tail, numbuf, sizeof(numbuf)); puts(numbuf); puts(" ");
-    puts("count:"); itoa_new(q_count(&test_q_2), numbuf, sizeof(numbuf)); puts(numbuf); puts(" free:"); itoa_new(q_space_free(&test_q_2), numbuf, sizeof(numbuf)); puts(numbuf); puts("\r\n");
-
-    if (!q_is_empty(&test_q_2)) {
-        tail_idx = test_q_2.tail;
-        val_tail = test_q_2.buf[tail_idx];
-        itoa_new(val_tail, numbuf, sizeof(numbuf)); puts("q2.buf[tail]:"); puts(numbuf); puts(" ");
-        prev_idx = (test_q_2.head - 1) & (Q_CAP - 1);
-        itoa_new(test_q_2.buf[prev_idx], numbuf, sizeof(numbuf)); puts("q2.buf[head-1]:"); puts(numbuf); puts("\r\n");
-    }
-
-    /* Print a small window of consecutive queue entries starting at tail. */
-    {
-        unsigned int idx = test_q_2.tail;
-        unsigned int i;
-        puts("q2.buf[window 8]:");
-        for (i = 0; i < 8u; ++i) {
-            unsigned int v = test_q_2.buf[idx];
-            itoa_new(v, numbuf, sizeof(numbuf)); puts(numbuf); puts(" ");
-            idx = (idx + 1) & (Q_CAP - 1);
-        }
-        puts("\r\n");
-    }
-
-    /* Print recent received values from consumer log */
-    {
-        unsigned int rp = recv_log_pos;
-        unsigned int i;
-        puts("recent_recv[8]:");
-        for (i = 0; i < 8u; ++i) {
-            unsigned int idx = (unsigned int)((rp - 8u + i) & 63u);
-            unsigned int v = recv_log[idx];
-            itoa_new(v, numbuf, sizeof(numbuf)); puts(numbuf); puts(" ");
-        }
-        puts("\r\n");
-    }
-
-    /* Print global instrumentation totals */
-    puts("ringq_total_pushed:"); itoa_new((unsigned int)(ringq_total_pushed & 0xFFFFFFFFu), numbuf, sizeof(numbuf)); puts(numbuf); puts(" ");
-    puts("ringq_total_popped:"); itoa_new((unsigned int)(ringq_total_popped & 0xFFFFFFFFu), numbuf, sizeof(numbuf)); puts(numbuf); puts("\r\n");
-
-#if defined(__CC65__)
-    /* disable interrupts to keep system halted */
-    __asm__("sei");
-#endif
-
-    for (;;) { /* halt */ }
-}
-
-
-
-
-/* ========== End TCP UART Tasks ========== */
-
 void main()
 {
     unsigned int i;
-    test_run_count = 0;
     scheduler_init();
 
     /* Seed RNG with tick count so different runs have different sequences */
@@ -533,6 +607,13 @@ void main()
     }
 
     #if USE_PUBSUB_BTREE_ONLY == 1
+        /* Fill test_items with random values */
+        printf("\n[MAIN] Generating %u random test items...\n", TEST_ITEM_COUNT);
+        for (i = 0; i < TEST_ITEM_COUNT; i++) {
+            test_items[i] = pseudo_random(100, 999);
+            printf("[MAIN] test_items[%u] = %u\n", i, test_items[i]);
+        }
+        
         printf("\n[MAIN] Initializing pub/sub system with message storage...\n");
         pubsub_init(&g_pubsub_mgr);
         
@@ -549,8 +630,16 @@ void main()
         pubsub_subscribe(&g_pubsub_mgr, "rp6502_pub_3", 
                         on_rp6502_btree, NULL);            
 
+        /* Create test items topic and subscribe consumer */
+        pubsub_create_topic(&g_pubsub_mgr, "test_items");
+        pubsub_subscribe(&g_pubsub_mgr, "test_items", 
+                        test_item_consumer, NULL);
+
         scheduler_add(pubsub_publish_task, NULL);
         scheduler_add(pubsub_monitor, NULL);
+        scheduler_add(test_producer_task, NULL);
+        scheduler_add(test_validator_task, NULL);
+        scheduler_add(test_cleanup_task, NULL);
         scheduler_add(idle_task, NULL);
     #endif
 
