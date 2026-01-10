@@ -25,34 +25,14 @@ static unsigned int _count3 = 0;
 #include <stdarg.h>
 #include "string_helpers.h"
 
-volatile unsigned int sleep_ms = 250;
-volatile unsigned int sleep_ms_short = 10;
-volatile unsigned int sleep_ms_producer = 50;
-volatile unsigned int sleep_ms_consumer = 200;
-volatile unsigned int consumed_item_1 = 0;
-volatile unsigned int consumed_item_2 = 0;
-volatile unsigned int produced_item = 0;
-volatile uint16_t task_a_counter = 1;
-volatile uint16_t task_b_counter = 2;
-
 /* Pub/Sub Manager for multi-topic messaging */
 static PubSubManager g_pubsub_mgr;
-
-#if USE_PUBSUB_BTREE_ONLY == 1
-/* Simple message storage for USE_PUBSUB_BTREE_ONLY - stores message values */
-#define MESSAGE_STORAGE_SIZE 32
-static void *message_storage[MESSAGE_STORAGE_SIZE];
-static unsigned int message_storage_count = 0;
-#endif
 
 /* Approximate total RAM available for the OS (matches rp6502.cfg:
     RAM start = $0200, size = $FD00 - __STACKSIZE__ where __STACKSIZE__ is $0800
     So total bytes = 0xFD00 - 0x0800 = 62464
 */
 static const unsigned int RAM_TOTAL_BYTES = 62464u;
-
-/* forward from scheduler.c */
-unsigned int scheduler_memory_usage(void);
 
 /* Simple pseudo-random generator (linear congruential method) */
 static unsigned int random_seed = 42u;
@@ -151,20 +131,6 @@ static void delay_ms(int ms)
             ;
 }
 
-/* Simple number parser */
-static int parse_number(char *str)
-{
-    int result = 0;
-    while (*str >= '0' && *str <= '9')
-    {
-        result = result * 10 + (*str - '0');
-        str++;
-    }
-    return result;
-}
-
-
-
 /* Idle task to keep ticks advancing when all other tasks are sleeping. */
 static void idle_task(void *arg)
 {
@@ -253,8 +219,7 @@ static void on_rp6502_btree(const char *topic, const PubSubMessage *message, voi
 /* ========== Test Producer/Validator Tasks for BTree ========== */
 
 #if USE_PUBSUB_BTREE_ONLY == 1
-/* Test items to be produced and validated */
-#define TEST_ITEM_COUNT 50
+#define TEST_ITEM_COUNT 1000
 static unsigned int test_items[TEST_ITEM_COUNT];
 static unsigned int test_items_produced = 0;
 static unsigned int test_items_consumed = 0;
