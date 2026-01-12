@@ -219,7 +219,7 @@ static void on_rp6502_btree(const char *topic, const PubSubMessage *message, voi
 /* ========== Test Producer/Validator Tasks for BTree ========== */
 
 #if USE_PUBSUB_BTREE_ONLY == 1
-#define TEST_ITEM_COUNT 100
+#define TEST_ITEM_COUNT 200
 #define NUM_PRODUCERS 2
 #define NUM_CONSUMERS 4
 static unsigned int test_items[TEST_ITEM_COUNT];
@@ -267,6 +267,7 @@ static void test_producer_task(void *arg)
     int pool_exhausted_this_round;
     int has_pending;
     int publish_succeeded;
+    int consumer_idx;
     PubSubMessage msg;
     int producer_id = (int)(unsigned long)arg;
     int producer_idx = producer_id - 1;  /* Array index (0-based) */
@@ -298,12 +299,13 @@ static void test_producer_task(void *arg)
             msg.key = (unsigned int)(*pending_ptr);
             msg.value = (void *)(unsigned long)test_items[*pending_ptr];
             
-            /* Create topic name based on producer_id */
-            snprintf(topic_name, sizeof(topic_name), "test_items_%d", producer_id);
+            /* Distribute items round-robin to consumers by topic */
+            consumer_idx = (*pending_ptr) % NUM_CONSUMERS;
+            snprintf(topic_name, sizeof(topic_name), "test_items_consumer_%d", consumer_idx);
             
             if (pubsub_publish(&g_pubsub_mgr, topic_name, &msg)) {
-                printf("[TEST_PRODUCER_%d] Published item %d: key=%u, value=%u\n", 
-                       producer_id, *pending_ptr, msg.key, test_items[*pending_ptr]);
+                printf("[TEST_PRODUCER_%d] Published item %d to consumer_%d: key=%u, value=%u\n", 
+                       producer_id, *pending_ptr, consumer_idx, msg.key, test_items[*pending_ptr]);
                 test_items_produced++;
                 *pending_ptr = -1;  /* Mark item as successfully sent */
                 publish_succeeded = 1;
@@ -657,19 +659,17 @@ void main()
         
         /* Initialize producer tracking */
         init_producer_tracking();
-        printf("[MAIN] Creating %u topics and subscribing with %u consumer(s) each...\n", 
-               NUM_PRODUCERS, NUM_CONSUMERS);
+        printf("[MAIN] Creating %u consumer topics for work-queue distribution...\n", 
+               NUM_CONSUMERS);
 
-        /* Dynamically create topics and subscribe consumers */
-        for (producer_id = 1; producer_id <= NUM_PRODUCERS; producer_id++) {
-            snprintf(topic_name, sizeof(topic_name), "test_items_%d", producer_id);
+        /* Create one topic per consumer for work-queue distribution */
+        for (i = 0; i < NUM_CONSUMERS; i++) {
+            snprintf(topic_name, sizeof(topic_name), "test_items_consumer_%d", i);
             pubsub_create_topic(&g_pubsub_mgr, topic_name);
             
-            /* Create NUM_CONSUMERS subscriptions for this topic */
-            for (i = 0; i < NUM_CONSUMERS; i++) {
-                pubsub_subscribe(&g_pubsub_mgr, topic_name, 
-                                test_item_consumer, NULL);
-            }
+            /* Each consumer subscribes to their own topic */
+            pubsub_subscribe(&g_pubsub_mgr, topic_name, 
+                            test_item_consumer, NULL);
         }
 
         scheduler_add(pubsub_monitor, NULL);
