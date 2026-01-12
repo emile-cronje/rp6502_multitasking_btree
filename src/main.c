@@ -224,40 +224,113 @@ static unsigned int test_items[TEST_ITEM_COUNT];
 static unsigned int test_items_produced = 0;
 static unsigned int test_items_consumed = 0;
 static unsigned char test_validation_complete = 0;
+/* Shared producer index - only one producer takes an item at a time */
+static unsigned int test_producer_index = 0;
 
-/* Producer task: sends test items to a special topic */
-static void test_producer_task(void *arg)
+/* Helper function: atomically get next item index for production */
+static int get_next_test_item_index(void)
 {
-    static unsigned int producer_index = 0;
+    if (test_producer_index < TEST_ITEM_COUNT) {
+        unsigned int current = test_producer_index;
+        test_producer_index++;
+        return (int)current;
+    }
+    return -1;  /* All items have been taken */
+}
+
+static void test_producer_task_1(void *arg)
+{
+    static unsigned char started = 0;
+    static int pending_item_index = -1;
+    int batch_attempt;
     PubSubMessage msg;
+    int pool_exhausted = 0;
     
     (void)arg;
     
-    if (producer_index == 0) {
-        printf("[TEST_PRODUCER] Starting producer with %u test items\n", TEST_ITEM_COUNT);
+    if (!started) {
+        printf("[TEST_PRODUCER_1] Starting producer, will take items from shared pool\n");
+        started = 1;
     }
     
-    /* Infinite loop publishing items until all are sent */
-    while (producer_index < TEST_ITEM_COUNT) {
-        msg.key = producer_index;
-        msg.value = (void *)(unsigned long)test_items[producer_index];
-        
-        if (pubsub_publish(&g_pubsub_mgr, "test_items", &msg)) {
-            printf("[TEST_PRODUCER] Published item %u: key=%u, value=%u\n", 
-                   producer_index, msg.key, test_items[producer_index]);
-            test_items_produced++;
-        } else {
-            printf("[TEST_PRODUCER] FAILED to publish item %u\n", producer_index);
+    /* Main loop - keep running until pool exhausted and validation complete */
+    while (!pool_exhausted || !test_validation_complete) {
+        /* Try to publish items in batches of 10 */
+        for (batch_attempt = 0; batch_attempt < 10; batch_attempt++) {
+            /* If no pending item, try to get next one */
+            if (pending_item_index < 0) {
+                pending_item_index = get_next_test_item_index();
+                if (pending_item_index < 0) {
+                    /* Pool exhausted */
+                    pool_exhausted = 1;
+                    break;  /* Exit batch loop */
+                }
+            }
+            
+            msg.key = (unsigned int)pending_item_index;
+            msg.value = (void *)(unsigned long)test_items[pending_item_index];
+            
+            if (pubsub_publish(&g_pubsub_mgr, "test_items_1", &msg)) {
+                printf("[TEST_PRODUCER_1] Published item %d: key=%u, value=%u\n", 
+                       pending_item_index, msg.key, test_items[pending_item_index]);
+                test_items_produced++;
+                pending_item_index = -1;  /* Mark item as successfully sent */
+            } else {
+                /* Queue full, stop this batch and yield */
+                break;  /* Exit batch loop and sleep */
+            }
         }
-        producer_index++;
-        scheduler_sleep(50);
+        
+        /* Sleep to yield to other tasks */
+        scheduler_sleep(10);
+    }
+}
+
+static void test_producer_task_2(void *arg)
+{
+    static unsigned char started = 0;
+    static int pending_item_index = -1;
+    int batch_attempt;
+    PubSubMessage msg;
+    int pool_exhausted = 0;
+    
+    (void)arg;
+    
+    if (!started) {
+        printf("[TEST_PRODUCER_2] Starting producer, will take items from shared pool\n");
+        started = 1;
     }
     
-    printf("[TEST_PRODUCER] All %u items sent\n", test_items_produced);
-    
-    /* Keep task alive after sending all items */
-    while (!test_validation_complete) {
-        scheduler_sleep(100);
+    /* Main loop - keep running until pool exhausted and validation complete */
+    while (!pool_exhausted || !test_validation_complete) {
+        /* Try to publish items in batches of 10 */
+        for (batch_attempt = 0; batch_attempt < 10; batch_attempt++) {
+            /* If no pending item, try to get next one */
+            if (pending_item_index < 0) {
+                pending_item_index = get_next_test_item_index();
+                if (pending_item_index < 0) {
+                    /* Pool exhausted */
+                    pool_exhausted = 1;
+                    break;  /* Exit batch loop */
+                }
+            }
+            
+            msg.key = (unsigned int)pending_item_index;
+            msg.value = (void *)(unsigned long)test_items[pending_item_index];
+            
+            if (pubsub_publish(&g_pubsub_mgr, "test_items_2", &msg)) {
+                printf("[TEST_PRODUCER_2] Published item %d: key=%u, value=%u\n", 
+                       pending_item_index, msg.key, test_items[pending_item_index]);
+                test_items_produced++;
+                pending_item_index = -1;  /* Mark item as successfully sent */
+            } else {
+                /* Queue full, stop this batch and yield */
+                break;  /* Exit batch loop and sleep */
+            }
+        }
+        
+        /* Sleep to yield to other tasks */
+        scheduler_sleep(10);
     }
 }
 
@@ -581,28 +654,19 @@ void main()
         
         printf("\n[MAIN] Initializing pub/sub system with message storage...\n");
         pubsub_init(&g_pubsub_mgr);
-        
-        pubsub_create_topic(&g_pubsub_mgr, "rp6502_pub_1");
-        pubsub_create_topic(&g_pubsub_mgr, "rp6502_pub_2");        
-        pubsub_create_topic(&g_pubsub_mgr, "rp6502_pub_3");                
-        
+       
         printf("[MAIN] Subscribing to topics with message storage...\n");
 
-        pubsub_subscribe(&g_pubsub_mgr, "rp6502_pub_1", 
-                        on_rp6502_btree, NULL);
-        pubsub_subscribe(&g_pubsub_mgr, "rp6502_pub_2", 
-                        on_rp6502_btree, NULL);
-        pubsub_subscribe(&g_pubsub_mgr, "rp6502_pub_3", 
-                        on_rp6502_btree, NULL);            
-
-        /* Create test items topic and subscribe consumer */
-        pubsub_create_topic(&g_pubsub_mgr, "test_items");
-        pubsub_subscribe(&g_pubsub_mgr, "test_items", 
+        pubsub_create_topic(&g_pubsub_mgr, "test_items_1");
+        pubsub_create_topic(&g_pubsub_mgr, "test_items_2");        
+        pubsub_subscribe(&g_pubsub_mgr, "test_items_1", 
+                        test_item_consumer, NULL);
+        pubsub_subscribe(&g_pubsub_mgr, "test_items_2", 
                         test_item_consumer, NULL);
 
-        scheduler_add(pubsub_publish_task, NULL);
         scheduler_add(pubsub_monitor, NULL);
-        scheduler_add(test_producer_task, NULL);
+        scheduler_add(test_producer_task_1, NULL);
+        scheduler_add(test_producer_task_2, NULL);        
         scheduler_add(test_validator_task, NULL);
         scheduler_add(test_cleanup_task, NULL);
         scheduler_add(idle_task, NULL);
