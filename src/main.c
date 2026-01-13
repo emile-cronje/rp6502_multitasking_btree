@@ -7,6 +7,7 @@
 #include <rp6502.h>
 #include <stdbool.h>
 #include <fcntl.h>
+#include <time.h>   /* For system clock timing */
 
 /* Configuration flags - must come before conditional includes */
 #define USE_PUBSUB_BTREE_ONLY 1
@@ -219,8 +220,8 @@ static void on_rp6502_btree(const char *topic, const PubSubMessage *message, voi
 /* ========== Test Producer/Validator Tasks for BTree ========== */
 
 #if USE_PUBSUB_BTREE_ONLY == 1
-#define TEST_ITEM_COUNT 200
-#define NUM_PRODUCERS 2
+#define TEST_ITEM_COUNT 100
+#define NUM_PRODUCERS 4
 #define NUM_CONSUMERS 4
 static unsigned int test_items[TEST_ITEM_COUNT];
 static unsigned int test_items_produced = 0;
@@ -231,6 +232,23 @@ static unsigned int test_producer_index = 0;
 /* Per-producer pending items (indexed by producer_id - 1) */
 static int producer_pending_items[NUM_PRODUCERS];
 static unsigned char producer_started[NUM_PRODUCERS];
+
+/* Timing tracking */
+static unsigned int time_test_started = 0;
+static unsigned int time_first_produced = 0;
+static unsigned int time_all_produced = 0;
+static unsigned int time_all_consumed = 0;
+static unsigned int time_validation_complete = 0;
+static unsigned long cpu_ticks_at_start = 0;
+static unsigned long cpu_ticks_at_end = 0;
+static unsigned long active_ticks_at_start = 0;
+static unsigned long active_ticks_at_end = 0;
+static clock_t sys_clock_at_start = 0;
+static clock_t sys_clock_at_end = 0;
+static unsigned char timing_first_produced_recorded = 0;
+static unsigned char timing_all_produced_recorded = 0;
+static unsigned char timing_all_consumed_recorded = 0;
+static unsigned char timing_validation_recorded = 0;
 /* Initialize producer tracking arrays */
 static void init_producer_tracking(void) {
     int i;
@@ -307,6 +325,23 @@ static void test_producer_task(void *arg)
                 printf("[TEST_PRODUCER_%d] Published item %d to consumer_%d: key=%u, value=%u\n", 
                        producer_id, *pending_ptr, consumer_idx, msg.key, test_items[*pending_ptr]);
                 test_items_produced++;
+                
+                /* Record timing for first production */
+                if (!timing_first_produced_recorded) {
+                    time_first_produced = scheduler_get_ticks();
+                    timing_first_produced_recorded = 1;
+                    printf("[TIMING] First item produced at tick %u (elapsed: %u ms)\n", 
+                           time_first_produced, time_first_produced - time_test_started);
+                }
+                
+                /* Record timing for all produced */
+                if (test_items_produced >= TEST_ITEM_COUNT && !timing_all_produced_recorded) {
+                    time_all_produced = scheduler_get_ticks();
+                    timing_all_produced_recorded = 1;
+                    printf("[TIMING] All %u items produced at tick %u (elapsed: %u ms)\n", 
+                           TEST_ITEM_COUNT, time_all_produced, time_all_produced - time_test_started);
+                }
+                
                 *pending_ptr = -1;  /* Mark item as successfully sent */
                 publish_succeeded = 1;
             } else {
@@ -353,6 +388,14 @@ static void test_item_consumer(const char *topic, const PubSubMessage *message, 
         /* Insert the message value into the test btree */
         btree_insert(g_test_btree, key, message->value);
         test_items_consumed++;
+        
+        /* Record timing for all consumed */
+        if (test_items_consumed >= TEST_ITEM_COUNT && !timing_all_consumed_recorded) {
+            time_all_consumed = scheduler_get_ticks();
+            timing_all_consumed_recorded = 1;
+            printf("[TIMING] All %u items consumed at tick %u (elapsed: %u ms)\n", 
+                   TEST_ITEM_COUNT, time_all_consumed, time_all_consumed - time_test_started);
+        }
         
         printf("[TEST_CONSUMER] Consumed item: key=%u, value=%lu\n",
                key, (unsigned long)message->value);
@@ -423,11 +466,74 @@ static void test_validator_task(void *arg)
         }
         /* Phase 2: Print summary and complete */
         else if (validator_phase == 2) {
+            unsigned int total_time;
+            unsigned int production_time;
+            unsigned int consumption_time;
+            
+            if (!timing_validation_recorded) {
+                time_validation_complete = scheduler_get_ticks();
+                cpu_ticks_at_end = scheduler_cpu_total_ticks();
+                active_ticks_at_end = scheduler_cpu_active_ticks();
+                sys_clock_at_end = clock();
+                timing_validation_recorded = 1;
+            }
+            
+            total_time = time_validation_complete - time_test_started;
+            production_time = time_all_produced - time_first_produced;
+            consumption_time = time_all_consumed - time_all_produced;
+            
             printf("[TEST_VALIDATOR] ========== VALIDATION SUMMARY ==========\n");
             printf("[TEST_VALIDATOR] Total items sent:     %u\n", TEST_ITEM_COUNT);
             printf("[TEST_VALIDATOR] Total items consumed: %u\n", test_items_consumed);
             printf("[TEST_VALIDATOR] Validation passed:    %u/%u\n", validation_passed, TEST_ITEM_COUNT);
             printf("[TEST_VALIDATOR] Validation failed:    %u/%u\n", validation_failed, TEST_ITEM_COUNT);
+            
+            printf("[TEST_VALIDATOR] ========== TIMING SUMMARY ==========\n");
+            printf("[TEST_VALIDATOR] Producers:           %u\n", NUM_PRODUCERS);
+            printf("[TEST_VALIDATOR] Consumers:           %u\n", NUM_CONSUMERS);
+            printf("[TEST_VALIDATOR] Total test time:     %u ms\n", total_time);
+            if (timing_first_produced_recorded) {
+                printf("[TEST_VALIDATOR] Time to first item:  %u ms\n", time_first_produced - time_test_started);
+            }
+            if (timing_all_produced_recorded) {
+                printf("[TEST_VALIDATOR] Time to produce all: %u ms\n", time_all_produced - time_test_started);
+                printf("[TEST_VALIDATOR] Production rate:    %u items/sec\n", 
+                       TEST_ITEM_COUNT * 1000 / (production_time ? production_time : 1));
+            }
+            if (timing_all_consumed_recorded) {
+                printf("[TEST_VALIDATOR] Time to consume all: %u ms\n", time_all_consumed - time_test_started);
+                printf("[TEST_VALIDATOR] Consumption rate:   %u items/sec\n", 
+                       TEST_ITEM_COUNT * 1000 / (consumption_time ? consumption_time : 1));
+            }
+            if (timing_validation_recorded) {
+                printf("[TEST_VALIDATOR] Time to validate all:%u ms\n", time_validation_complete - time_all_consumed);
+            }
+            
+            printf("[TEST_VALIDATOR] ========== CPU EFFICIENCY METRICS ==========\n");
+            if (cpu_ticks_at_end > cpu_ticks_at_start) {
+                unsigned long total_cpu_ticks = cpu_ticks_at_end - cpu_ticks_at_start;
+                unsigned long active_cpu_ticks = active_ticks_at_end - active_ticks_at_start;
+                unsigned int cpu_usage = (total_cpu_ticks > 0) ? (unsigned int)((active_cpu_ticks * 100) / total_cpu_ticks) : 0;
+                printf("[TEST_VALIDATOR] CPU total ticks:      %lu\n", total_cpu_ticks);
+                printf("[TEST_VALIDATOR] CPU active ticks:     %lu\n", active_cpu_ticks);
+                printf("[TEST_VALIDATOR] CPU efficiency:       %u%%\n", cpu_usage);
+                printf("[TEST_VALIDATOR] Avg ticks/item:       %lu\n", total_cpu_ticks / (TEST_ITEM_COUNT > 0 ? TEST_ITEM_COUNT : 1));
+            }
+            
+            printf("[TEST_VALIDATOR] ========== SYSTEM CLOCK METRICS ==========\n");
+            if (sys_clock_at_end > sys_clock_at_start) {
+                clock_t sys_elapsed = sys_clock_at_end - sys_clock_at_start;
+                clock_t clocks_per_sec = CLOCKS_PER_SEC;
+                printf("[TEST_VALIDATOR] System clock start:   %lu\n", (unsigned long)sys_clock_at_start);
+                printf("[TEST_VALIDATOR] System clock end:     %lu\n", (unsigned long)sys_clock_at_end);
+                printf("[TEST_VALIDATOR] System clock elapsed:%lu (ticks)\n", (unsigned long)sys_elapsed);
+                printf("[TEST_VALIDATOR] Clocks per second:    %lu\n", (unsigned long)clocks_per_sec);
+                if (clocks_per_sec > 0) {
+                    unsigned int ms_elapsed = (unsigned int)((sys_elapsed * 1000) / clocks_per_sec);
+                    printf("[TEST_VALIDATOR] Elapsed time (sec):   %u.%03u seconds\n", 
+                           ms_elapsed / 1000, ms_elapsed % 1000);
+                }
+            }
             
             if (validation_failed == 0) {
                 printf("[TEST_VALIDATOR] ========== ALL VALIDATIONS PASSED! ==========\n");
@@ -647,6 +753,14 @@ void main()
     }
 
     #if USE_PUBSUB_BTREE_ONLY == 1
+        /* Record test start time and CPU metrics */
+        time_test_started = scheduler_get_ticks();
+        cpu_ticks_at_start = scheduler_cpu_total_ticks();
+        active_ticks_at_start = scheduler_cpu_active_ticks();
+        sys_clock_at_start = clock();
+        printf("[TIMING] Test started at scheduler tick %u, system clock %lu\n", 
+               time_test_started, (unsigned long)sys_clock_at_start);
+        
         /* Fill test_items with random values */
         printf("\n[MAIN] Generating %u random test items...\n", TEST_ITEM_COUNT);
         for (i = 0; i < TEST_ITEM_COUNT; i++) {
