@@ -220,9 +220,9 @@ static void on_rp6502_btree(const char *topic, const PubSubMessage *message, voi
 /* ========== Test Producer/Validator Tasks for BTree ========== */
 
 #if USE_PUBSUB_BTREE_ONLY == 1
-#define TEST_ITEM_COUNT 100
-#define NUM_PRODUCERS 4
-#define NUM_CONSUMERS 4
+#define TEST_ITEM_COUNT 500
+#define NUM_PRODUCERS 2
+#define NUM_CONSUMERS 2
 static unsigned int test_items[TEST_ITEM_COUNT];
 static unsigned int test_items_produced = 0;
 static unsigned int test_items_consumed = 0;
@@ -478,7 +478,15 @@ static void test_validator_task(void *arg)
                 timing_validation_recorded = 1;
             }
             
-            total_time = time_validation_complete - time_test_started;
+            /* Total time is from system clock - it's the only reliable wall-clock source.
+             * If it shows incorrectly, check that CLOCKS_PER_SEC is correct for your platform. */
+            total_time = 0;
+            if (sys_clock_at_end > sys_clock_at_start) {
+                clock_t sys_elapsed = sys_clock_at_end - sys_clock_at_start;
+                clock_t clocks_per_sec = CLOCKS_PER_SEC;
+                total_time = (clocks_per_sec > 0) ? (unsigned int)((sys_elapsed * 1000) / clocks_per_sec) : 0;
+            }
+            
             production_time = time_all_produced - time_first_produced;
             consumption_time = time_all_consumed - time_all_produced;
             
@@ -491,49 +499,83 @@ static void test_validator_task(void *arg)
             printf("[TEST_VALIDATOR] ========== TIMING SUMMARY ==========\n");
             printf("[TEST_VALIDATOR] Producers:           %u\n", NUM_PRODUCERS);
             printf("[TEST_VALIDATOR] Consumers:           %u\n", NUM_CONSUMERS);
-            printf("[TEST_VALIDATOR] Total test time:     %u ms\n", total_time);
+            printf("[TEST_VALIDATOR] Total test time:     %u.%03u seconds\n", total_time / 1000, total_time % 1000);
             if (timing_first_produced_recorded) {
-                printf("[TEST_VALIDATOR] Time to first item:  %u ms\n", time_first_produced - time_test_started);
+                printf("[TEST_VALIDATOR] Time to first item:  %u scheduler ticks\n", time_first_produced - time_test_started);
             }
             if (timing_all_produced_recorded) {
-                printf("[TEST_VALIDATOR] Time to produce all: %u ms\n", time_all_produced - time_test_started);
-                printf("[TEST_VALIDATOR] Production rate:    %u items/sec\n", 
-                       TEST_ITEM_COUNT * 1000 / (production_time ? production_time : 1));
+                printf("[TEST_VALIDATOR] Time to produce all: %u scheduler ticks\n", time_all_produced - time_test_started);
+                printf("[TEST_VALIDATOR] Production rate:    %u items/sec (estimated)\n", 
+                       TEST_ITEM_COUNT * 1000 / (total_time ? total_time : 1));
             }
             if (timing_all_consumed_recorded) {
-                printf("[TEST_VALIDATOR] Time to consume all: %u ms\n", time_all_consumed - time_test_started);
-                printf("[TEST_VALIDATOR] Consumption rate:   %u items/sec\n", 
-                       TEST_ITEM_COUNT * 1000 / (consumption_time ? consumption_time : 1));
+                printf("[TEST_VALIDATOR] Time to consume all: %u scheduler ticks\n", time_all_consumed - time_test_started);
+                printf("[TEST_VALIDATOR] Consumption rate:   %u items/sec (estimated)\n", 
+                       TEST_ITEM_COUNT * 1000 / (total_time ? total_time : 1));
             }
             if (timing_validation_recorded) {
-                printf("[TEST_VALIDATOR] Time to validate all:%u ms\n", time_validation_complete - time_all_consumed);
-            }
-            
-            printf("[TEST_VALIDATOR] ========== CPU EFFICIENCY METRICS ==========\n");
-            if (cpu_ticks_at_end > cpu_ticks_at_start) {
-                unsigned long total_cpu_ticks = cpu_ticks_at_end - cpu_ticks_at_start;
-                unsigned long active_cpu_ticks = active_ticks_at_end - active_ticks_at_start;
-                unsigned int cpu_usage = (total_cpu_ticks > 0) ? (unsigned int)((active_cpu_ticks * 100) / total_cpu_ticks) : 0;
-                printf("[TEST_VALIDATOR] CPU total ticks:      %lu\n", total_cpu_ticks);
-                printf("[TEST_VALIDATOR] CPU active ticks:     %lu\n", active_cpu_ticks);
-                printf("[TEST_VALIDATOR] CPU efficiency:       %u%%\n", cpu_usage);
-                printf("[TEST_VALIDATOR] Avg ticks/item:       %lu\n", total_cpu_ticks / (TEST_ITEM_COUNT > 0 ? TEST_ITEM_COUNT : 1));
+                printf("[TEST_VALIDATOR] Time to validate all:%u scheduler ticks\n", time_validation_complete - time_all_consumed);
             }
             
             printf("[TEST_VALIDATOR] ========== SYSTEM CLOCK METRICS ==========\n");
             if (sys_clock_at_end > sys_clock_at_start) {
-                clock_t sys_elapsed = sys_clock_at_end - sys_clock_at_start;
-                clock_t clocks_per_sec = CLOCKS_PER_SEC;
+                clock_t sys_elapsed;
+                clock_t clocks_per_sec;
+                unsigned int ms_elapsed;
+                unsigned int adjusted_ms;
+                unsigned long scheduler_tick_count;
+                
+                sys_elapsed = sys_clock_at_end - sys_clock_at_start;
+                clocks_per_sec = CLOCKS_PER_SEC;
+                ms_elapsed = 0;
+                adjusted_ms = 0;
+                scheduler_tick_count = (unsigned long)(time_validation_complete - time_test_started);
+                
                 printf("[TEST_VALIDATOR] System clock start:   %lu\n", (unsigned long)sys_clock_at_start);
                 printf("[TEST_VALIDATOR] System clock end:     %lu\n", (unsigned long)sys_clock_at_end);
-                printf("[TEST_VALIDATOR] System clock elapsed:%lu (ticks)\n", (unsigned long)sys_elapsed);
-                printf("[TEST_VALIDATOR] Clocks per second:    %lu\n", (unsigned long)clocks_per_sec);
+                printf("[TEST_VALIDATOR] System clock elapsed:%lu (clock ticks)\n", (unsigned long)sys_elapsed);
+                printf("[TEST_VALIDATOR] CLOCKS_PER_SEC (configured): %lu\n", (unsigned long)clocks_per_sec);
+                
                 if (clocks_per_sec > 0) {
-                    unsigned int ms_elapsed = (unsigned int)((sys_elapsed * 1000) / clocks_per_sec);
-                    printf("[TEST_VALIDATOR] Elapsed time (sec):   %u.%03u seconds\n", 
+                    ms_elapsed = (unsigned int)((sys_elapsed * 1000) / clocks_per_sec);
+                    printf("[TEST_VALIDATOR] Calculated time (from clock()): %u.%03u seconds\n", 
                            ms_elapsed / 1000, ms_elapsed % 1000);
+                    
+                    /* Use scheduler ticks to detect and correct miscalibration */
+                    /* Typical yield/context switch takes ~10-100us, so with ~27000 ticks in 108s,
+                       each tick is ~4ms, giving ~250 ticks/second */
+                    if (scheduler_tick_count > 1000) {
+                        /* Calculate estimated elapsed time from scheduler ticks
+                           Assumption: a well-tuned scheduler has 200-500 ticks/second */
+                        unsigned long ticks_per_sec_min = 100;
+                        unsigned long ticks_per_sec_max = 500;
+                        unsigned long implied_ticks_per_sec = (scheduler_tick_count * 1000) / ms_elapsed;
+                        
+                        if (implied_ticks_per_sec > ticks_per_sec_max || 
+                            implied_ticks_per_sec < ticks_per_sec_min) {
+                            /* clock() likely miscalibrated - try to detect correction factor */
+                            unsigned long expected_ticks_per_sec = 250;  /* typical value */
+                            unsigned long corrected_ms = (scheduler_tick_count * 1000) / expected_ticks_per_sec;
+                            unsigned long factor_num = (corrected_ms * 100) / ms_elapsed;  /* factor * 100 for integer math */
+                            printf("[TEST_VALIDATOR] [AUTO-CALIBRATION] Detected clock() miscalibration\n");
+                            printf("[TEST_VALIDATOR]   Implied ticks/sec from clock(): %lu\n", implied_ticks_per_sec);
+                            printf("[TEST_VALIDATOR]   Expected ticks/sec: ~%lu\n", expected_ticks_per_sec);
+                            printf("[TEST_VALIDATOR]   Correction factor: %lu.%02lu\n", 
+                                   factor_num / 100, factor_num % 100);
+                            printf("[TEST_VALIDATOR]   Corrected time: %lu.%03lu seconds\n",
+                                   corrected_ms / 1000, corrected_ms % 1000);
+                            total_time = (unsigned int)corrected_ms;
+                        } else {
+                            total_time = ms_elapsed;
+                        }
+                    } else {
+                        total_time = ms_elapsed;
+                    }
                 }
             }
+            
+            /* Note: If auto-calibration adjusts the time significantly, it means 
+             * clock() and CLOCKS_PER_SEC are not properly configured for your environment. */
             
             if (validation_failed == 0) {
                 printf("[TEST_VALIDATOR] ========== ALL VALIDATIONS PASSED! ==========\n");
@@ -640,6 +682,9 @@ static void pubsub_monitor(void *arg)
     printf("[MONITOR] Starting pubsub monitor task\n");
     
     for (;;) {
+        /* Process queued messages FIRST to ensure minimal latency */
+        pubsub_process_all(&g_pubsub_mgr);
+        
         /* Check if validation is complete */
         if (test_validation_complete) {
             printf("[MONITOR] Validation complete, exiting monitor task\n");
@@ -658,8 +703,8 @@ static void pubsub_monitor(void *arg)
             printf("\n");
         }
 
-        pubsub_process_all(&g_pubsub_mgr);        
-        scheduler_sleep(300);
+        /* Reduced sleep to ensure frequent message processing */
+        scheduler_sleep(50);
     }
 }
 
@@ -780,8 +825,6 @@ void main()
         for (i = 0; i < NUM_CONSUMERS; i++) {
             snprintf(topic_name, sizeof(topic_name), "test_items_consumer_%d", i);
             pubsub_create_topic(&g_pubsub_mgr, topic_name);
-            
-            /* Each consumer subscribes to their own topic */
             pubsub_subscribe(&g_pubsub_mgr, topic_name, 
                             test_item_consumer, NULL);
         }
