@@ -221,8 +221,8 @@ static void on_rp6502_btree(const char *topic, const PubSubMessage *message, voi
 
 #if USE_PUBSUB_BTREE_ONLY == 1
 #define TEST_ITEM_COUNT 250
-#define NUM_PRODUCERS 2
-#define NUM_CONSUMERS 2
+#define NUM_PRODUCERS 4
+#define NUM_CONSUMERS 4
 #define JSON_ITEM_COUNT 125   /* Number of items with JSON data */
 #define MAX_JSON_SIZE 64    /* Max size for JSON strings */
 
@@ -387,6 +387,7 @@ static void test_producer_task(void *arg)
 static void test_item_consumer(const char *topic, const PubSubMessage *message, void *user_data)
 {
     unsigned int key;
+    unsigned int consumer_id = (unsigned int)(unsigned long)user_data;
     
     /* Ensure test btree is initialized */
     if (g_test_btree == NULL) {
@@ -394,7 +395,7 @@ static void test_item_consumer(const char *topic, const PubSubMessage *message, 
     }
     
     if (g_test_btree == NULL) {
-        printf("[TEST_CONSUMER] FAILED to create test btree\n");
+        printf("[TEST_CONSUMER_%u] FAILED to create test btree\n", consumer_id);
         return;
     }
     
@@ -403,7 +404,7 @@ static void test_item_consumer(const char *topic, const PubSubMessage *message, 
     
     /* Check if this is a duplicate (already consumed) */
     if (btree_get(g_test_btree, key) != NULL) {
-        printf("[TEST_CONSUMER] WARNING: Duplicate item received: key=%u\n", key);
+        printf("[TEST_CONSUMER_%u] WARNING: Duplicate item received: key=%u\n", consumer_id, key);
     } else {
         /* Insert the message value into the test btree */
         btree_insert(g_test_btree, key, message->value);
@@ -411,9 +412,9 @@ static void test_item_consumer(const char *topic, const PubSubMessage *message, 
         
         /* Log JSON or numeric based on what it is */
         if (key < JSON_ITEM_COUNT && test_items[key].has_json) {
-            printf("[TEST_CONSUMER] Consumed JSON item[%u]: %s\n", key, (const char *)message->value);
+            printf("[TEST_CONSUMER_%u] Consumed JSON item[%u]: %s\n", consumer_id, key, (const char *)message->value);
         } else {
-            printf("[TEST_CONSUMER] Consumed numeric item[%u]: %u\n", key, (unsigned int)(unsigned long)message->value);
+            printf("[TEST_CONSUMER_%u] Consumed numeric item[%u]: %u\n", consumer_id, key, (unsigned int)(unsigned long)message->value);
         }
         
         /* Record timing for all consumed */
@@ -887,7 +888,7 @@ void main()
             snprintf(topic_name, sizeof(topic_name), "test_items_consumer_%d", i);
             pubsub_create_topic(&g_pubsub_mgr, topic_name);
             pubsub_subscribe(&g_pubsub_mgr, topic_name, 
-                            test_item_consumer, NULL);
+                            test_item_consumer, (void *)(unsigned long)i);
         }
 
         scheduler_add(pubsub_monitor, NULL);

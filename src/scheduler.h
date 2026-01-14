@@ -10,7 +10,7 @@ unsigned int scheduler_get_cpu_frequency(void);
 
 /* Config */
 #ifndef SCHED_MAX_TASKS
-#define SCHED_MAX_TASKS 10
+#define SCHED_MAX_TASKS 15
 #endif
 
 #ifndef SCHED_TASK_STACK_SIZE
