@@ -220,10 +220,20 @@ static void on_rp6502_btree(const char *topic, const PubSubMessage *message, voi
 /* ========== Test Producer/Validator Tasks for BTree ========== */
 
 #if USE_PUBSUB_BTREE_ONLY == 1
-#define TEST_ITEM_COUNT 500
-#define NUM_PRODUCERS 2
-#define NUM_CONSUMERS 2
-static unsigned int test_items[TEST_ITEM_COUNT];
+#define TEST_ITEM_COUNT 250
+#define NUM_PRODUCERS 4
+#define NUM_CONSUMERS 4
+#define JSON_ITEM_COUNT 5   /* Number of items with JSON data */
+#define MAX_JSON_SIZE 32    /* Max size for JSON strings */
+
+/* Test item data structure - holds both numeric and JSON data */
+struct TestItem {
+    unsigned int numeric_value;
+    char json_data[MAX_JSON_SIZE];
+    unsigned char has_json;
+};
+
+static struct TestItem test_items[TEST_ITEM_COUNT];
 static unsigned int test_items_produced = 0;
 static unsigned int test_items_consumed = 0;
 static unsigned char test_validation_complete = 0;
@@ -315,15 +325,26 @@ static void test_producer_task(void *arg)
         /* Try to publish pending item (if we have one) */
         if (*pending_ptr >= 0 && *pending_ptr < TEST_ITEM_COUNT) {
             msg.key = (unsigned int)(*pending_ptr);
-            msg.value = (void *)(unsigned long)test_items[*pending_ptr];
+            
+            /* Publish JSON data if available, otherwise publish numeric value */
+            if (test_items[*pending_ptr].has_json) {
+                msg.value = (void *)test_items[*pending_ptr].json_data;
+            } else {
+                msg.value = (void *)(unsigned long)test_items[*pending_ptr].numeric_value;
+            }
             
             /* Distribute items round-robin to consumers by topic */
             consumer_idx = (*pending_ptr) % NUM_CONSUMERS;
             snprintf(topic_name, sizeof(topic_name), "test_items_consumer_%d", consumer_idx);
             
             if (pubsub_publish(&g_pubsub_mgr, topic_name, &msg)) {
-                printf("[TEST_PRODUCER_%d] Published item %d to consumer_%d: key=%u, value=%u\n", 
-                       producer_id, *pending_ptr, consumer_idx, msg.key, test_items[*pending_ptr]);
+                if (test_items[*pending_ptr].has_json) {
+                    printf("[TEST_PRODUCER_%d] Published item %d JSON to consumer_%d: %s\n", 
+                           producer_id, *pending_ptr, consumer_idx, test_items[*pending_ptr].json_data);
+                } else {
+                    printf("[TEST_PRODUCER_%d] Published item %d to consumer_%d: key=%u, value=%u\n", 
+                           producer_id, *pending_ptr, consumer_idx, msg.key, test_items[*pending_ptr].numeric_value);
+                }
                 test_items_produced++;
                 
                 /* Record timing for first production */
@@ -382,12 +403,18 @@ static void test_item_consumer(const char *topic, const PubSubMessage *message, 
     
     /* Check if this is a duplicate (already consumed) */
     if (btree_get(g_test_btree, key) != NULL) {
-        printf("[TEST_CONSUMER] WARNING: Duplicate item received: key=%u, value=%lu\n",
-               key, (unsigned long)message->value);
+        printf("[TEST_CONSUMER] WARNING: Duplicate item received: key=%u\n", key);
     } else {
         /* Insert the message value into the test btree */
         btree_insert(g_test_btree, key, message->value);
         test_items_consumed++;
+        
+        /* Log JSON or numeric based on what it is */
+        if (key < JSON_ITEM_COUNT && test_items[key].has_json) {
+            printf("[TEST_CONSUMER] Consumed JSON item[%u]: %s\n", key, (const char *)message->value);
+        } else {
+            printf("[TEST_CONSUMER] Consumed numeric item[%u]: %u\n", key, (unsigned int)(unsigned long)message->value);
+        }
         
         /* Record timing for all consumed */
         if (test_items_consumed >= TEST_ITEM_COUNT && !timing_all_consumed_recorded) {
@@ -396,9 +423,6 @@ static void test_item_consumer(const char *topic, const PubSubMessage *message, 
             printf("[TIMING] All %u items consumed at tick %u (elapsed: %u ms)\n", 
                    TEST_ITEM_COUNT, time_all_consumed, time_all_consumed - time_test_started);
         }
-        
-        printf("[TEST_CONSUMER] Consumed item: key=%u, value=%lu\n",
-               key, (unsigned long)message->value);
     }
     
     (void)topic;
@@ -441,17 +465,36 @@ static void test_validator_task(void *arg)
         else if (validator_phase == 1) {
             if (validation_index < TEST_ITEM_COUNT) {
                 if (g_test_btree != NULL) {
-                    expected = (unsigned long)test_items[validation_index];
                     retrieved_value = btree_get(g_test_btree, validation_index);
                     
-                    if (retrieved_value == (void *)expected) {
-                        printf("[TEST_VALIDATOR] PASS: item[%u] = %lu (found in btree)\n", 
-                               validation_index, expected);
-                        validation_passed++;
-                    } else {
-                        printf("[TEST_VALIDATOR] FAIL: item[%u] = %lu (got %p from btree)\n", 
-                               validation_index, expected, retrieved_value);
-                        validation_failed++;
+                    /* Validate JSON items */
+                    if (validation_index < JSON_ITEM_COUNT && test_items[validation_index].has_json) {
+                        const char *expected_json = test_items[validation_index].json_data;
+                        const char *retrieved_json = (const char *)retrieved_value;
+                        
+                        if (retrieved_value != NULL && strcmp(retrieved_json, expected_json) == 0) {
+                            printf("[TEST_VALIDATOR] PASS: item[%u] JSON valid: %s\n", 
+                                   validation_index, expected_json);
+                            validation_passed++;
+                        } else {
+                            printf("[TEST_VALIDATOR] FAIL: item[%u] JSON mismatch. Expected: %s, Got: %s\n", 
+                                   validation_index, expected_json, retrieved_json ? retrieved_json : "NULL");
+                            validation_failed++;
+                        }
+                    } 
+                    /* Validate numeric items */
+                    else {
+                        expected = (unsigned long)test_items[validation_index].numeric_value;
+                        
+                        if (retrieved_value == (void *)expected) {
+                            printf("[TEST_VALIDATOR] PASS: item[%u] = %lu (numeric, found in btree)\n", 
+                                   validation_index, expected);
+                            validation_passed++;
+                        } else {
+                            printf("[TEST_VALIDATOR] FAIL: item[%u] = %lu (got %p from btree)\n", 
+                                   validation_index, expected, retrieved_value);
+                            validation_failed++;
+                        }
                     }
                 } else {
                     printf("[TEST_VALIDATOR] ERROR: test btree is NULL\n");
@@ -806,11 +849,26 @@ void main()
         printf("[TIMING] Test started at scheduler tick %u, system clock %lu\n", 
                time_test_started, (unsigned long)sys_clock_at_start);
         
-        /* Fill test_items with random values */
-        printf("\n[MAIN] Generating %u random test items...\n", TEST_ITEM_COUNT);
+        /* Generate test data (numeric and JSON) */
+        printf("\n[MAIN] Generating %u test items (%u with JSON data)...\n", TEST_ITEM_COUNT, JSON_ITEM_COUNT);
         for (i = 0; i < TEST_ITEM_COUNT; i++) {
-            test_items[i] = pseudo_random(100, 999);
-            printf("[MAIN] test_items[%u] = %u\n", i, test_items[i]);
+            test_items[i].numeric_value = pseudo_random(100, 999);
+            test_items[i].has_json = 0;
+            test_items[i].json_data[0] = '\0';
+            
+            /* Add JSON data to first JSON_ITEM_COUNT items */
+            if (i < JSON_ITEM_COUNT) {
+                unsigned int id = i + 1000;
+                unsigned int value = pseudo_random(10, 100);
+                unsigned int timestamp = i * 10;
+                snprintf(test_items[i].json_data, MAX_JSON_SIZE,
+                        "{\"id\":%u,\"val\":%u,\"ts\":%u}",
+                        id, value, timestamp);
+                test_items[i].has_json = 1;
+                printf("[MAIN] test_items[%u] JSON: %s\n", i, test_items[i].json_data);
+            } else if (i % 50 == 0) {
+                printf("[MAIN] test_items[%u] = %u (numeric only)\n", i, test_items[i].numeric_value);
+            }
         }
         
         printf("\n[MAIN] Initializing pub/sub system with message storage...\n");
