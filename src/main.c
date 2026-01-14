@@ -221,10 +221,10 @@ static void on_rp6502_btree(const char *topic, const PubSubMessage *message, voi
 
 #if USE_PUBSUB_BTREE_ONLY == 1
 #define TEST_ITEM_COUNT 250
-#define NUM_PRODUCERS 4
-#define NUM_CONSUMERS 4
-#define JSON_ITEM_COUNT 5   /* Number of items with JSON data */
-#define MAX_JSON_SIZE 32    /* Max size for JSON strings */
+#define NUM_PRODUCERS 2
+#define NUM_CONSUMERS 2
+#define JSON_ITEM_COUNT 125   /* Number of items with JSON data */
+#define MAX_JSON_SIZE 64    /* Max size for JSON strings */
 
 /* Test item data structure - holds both numeric and JSON data */
 struct TestItem {
@@ -861,9 +861,12 @@ void main()
                 unsigned int id = i + 1000;
                 unsigned int value = pseudo_random(10, 100);
                 unsigned int timestamp = i * 10;
+                unsigned int priority = pseudo_random(1, 9);
+                unsigned int flag = pseudo_random(0, 1);
+                /* Fill up to MAX_JSON_SIZE with valid JSON data */
                 snprintf(test_items[i].json_data, MAX_JSON_SIZE,
-                        "{\"id\":%u,\"val\":%u,\"ts\":%u}",
-                        id, value, timestamp);
+                        "{\"id\":%u,\"val\":%u,\"ts\":%u,\"status\":\"active\",\"pri\":%u,\"flag\":%u}",
+                        id, value, timestamp, priority, flag);
                 test_items[i].has_json = 1;
                 printf("[MAIN] test_items[%u] JSON: %s\n", i, test_items[i].json_data);
             } else if (i % 50 == 0) {
