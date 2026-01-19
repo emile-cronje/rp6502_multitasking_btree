@@ -29,12 +29,6 @@ static unsigned int _count3 = 0;
 /* Pub/Sub Manager for multi-topic messaging */
 static PubSubManager g_pubsub_mgr;
 
-/* Approximate total RAM available for the OS (matches rp6502.cfg:
-    RAM start = $0200, size = $FD00 - __STACKSIZE__ where __STACKSIZE__ is $0800
-    So total bytes = 0xFD00 - 0x0800 = 62464
-*/
-static const unsigned int RAM_TOTAL_BYTES = 62464u;
-
 /* Simple pseudo-random generator (linear congruential method) */
 static unsigned int random_seed = 42u;
 
@@ -162,67 +156,18 @@ static bool is_likely_string(const void *ptr)
     return false; /* no terminator within bound */
 }
 
-static void on_rp6502(const char *topic, const PubSubMessage *message, void *user_data)
-{
-    if (is_likely_string(message->value)) {
-        printf("[STATUS_SUBSCRIBER] Received on topic '%s': key=%d, text=%s\n",
-               topic, message->key, (const char *)message->value);
-    } else {
-        unsigned long numeric = (unsigned long)message->value;
-        printf("[STATUS_SUBSCRIBER] Received on topic '%s': key=%d, value=%lu\n",
-               topic, message->key, numeric);
-    }
-    (void)user_data;
-}
 
 #if USE_PUBSUB_BTREE_ONLY == 1
-/* B-tree instance for storing consumed messages from main topics */
-static BTree *g_consumer_btree = NULL;
-static unsigned int g_btree_insert_count = 0;
-
 /* Separate B-tree instance for test items */
 static BTree *g_test_btree = NULL;
-
-static void on_rp6502_btree(const char *topic, const PubSubMessage *message, void *user_data)
-{
-    unsigned int key;
-    
-    /* Ensure btree is initialized */
-    if (g_consumer_btree == NULL) {
-        g_consumer_btree = btree_create();
-        if (g_consumer_btree == NULL) {
-            printf("[BTREE_SUBSCRIBER] FAILED to create btree\n");
-            return;
-        }
-    }
-    
-    /* Use a unique key for each inserted message (use message key and a counter) */
-    key = (message->key << 16) | (g_btree_insert_count & 0xFFFF);
-    
-    /* Insert the message value into the btree */
-    btree_insert(g_consumer_btree, key, message->value);
-    g_btree_insert_count++;
-    
-    /* Check if this is a string message (from rp6502_pub_3 with JSON) or numeric (from pub_1/pub_2) */
-    if (is_likely_string(message->value)) {
-        printf("[BTREE_SUBSCRIBER] Received on topic '%s': key=%d, text=%s, stored_in_btree with key=%u\n",
-               topic, message->key, (const char *)message->value, key);
-    } else {
-        unsigned long numeric = (unsigned long)message->value;
-        printf("[BTREE_SUBSCRIBER] Received on topic '%s': key=%d, value=%lu, stored_in_btree with key=%u\n",
-               topic, message->key, numeric, key);
-    }
-
-    (void)user_data;
-}
 #endif
 
 /* ========== Test Producer/Validator Tasks for BTree ========== */
 
 #if USE_PUBSUB_BTREE_ONLY == 1
-#define TEST_ITEM_COUNT 250
-#define NUM_PRODUCERS 4
-#define NUM_CONSUMERS 4
+#define TEST_ITEM_COUNT 300
+#define NUM_PRODUCERS 2
+#define NUM_CONSUMERS 2
 #define JSON_ITEM_COUNT 125   /* Number of items with JSON data */
 #define MAX_JSON_SIZE 64    /* Max size for JSON strings */
 
