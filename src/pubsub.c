@@ -350,4 +350,3 @@ void pubsub_poll_mqtt(PubSubManager *mgr)
         pubsub_publish_from_external(mgr, topic, &message);
     }
 }
-

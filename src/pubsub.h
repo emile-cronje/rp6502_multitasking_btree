@@ -111,12 +111,4 @@ void pubsub_set_mqtt_adapter(PubSubManager *mgr, const PubSubMqttAdapter *adapte
 bool pubsub_publish_from_external(PubSubManager *mgr, const char *topic, const PubSubMessage *message);
 void pubsub_poll_mqtt(PubSubManager *mgr);
 
-/* Convenience function to create a key/value message */
-static inline PubSubMessage pubsub_make_message(int key, void *value) {
-    PubSubMessage msg;
-    msg.key = key;
-    msg.value = value;
-    return msg;
-}
-
 #endif /* PUBSUB_H */

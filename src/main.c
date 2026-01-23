@@ -12,10 +12,19 @@
 /* Configuration flags - must come before conditional includes */
 #define USE_PUBSUB_BTREE_ONLY 1
 
-/* Move declarations to the top of the file */
-static unsigned int _count1 = 0;
-static unsigned int _count2 = 0;
-static unsigned int _count3 = 0;
+#if USE_PUBSUB_BTREE_ONLY == 1
+/* Separate B-tree instance for test items */
+static BTree *g_test_btree = NULL;
+#endif
+
+/* ========== Test Producer/Validator Tasks for BTree ========== */
+
+#if USE_PUBSUB_BTREE_ONLY == 1
+#define TEST_ITEM_COUNT 250
+#define NUM_PRODUCERS 2
+#define NUM_CONSUMERS 2
+#define JSON_ITEM_COUNT 125   /* Number of items with JSON data */
+#define MAX_JSON_SIZE 64    /* Max size for JSON strings */
 
 /* Task to simulate memory usage fluctuation using malloc */
 #include "scheduler.h"
@@ -68,64 +77,6 @@ static void fail_halt(const char *msg, unsigned int a, unsigned int b);
 
 /* ========== TCP UART Helper Functions ========== */
 
-/* Simple string search function */
-static char* my_strstr(const char *haystack, const char *needle)
-{
-    const char *h, *n;
-    
-    if (!*needle)
-        return (char*)haystack;
-    
-    while (*haystack)
-    {
-        h = haystack;
-        n = needle;
-        
-        while (*h && *n && (*h == *n))
-        {
-            h++;
-            n++;
-        }
-        
-        if (!*n)
-            return (char*)haystack;
-        
-        haystack++;
-    }
-    
-    return NULL;
-}
-
-/* Simple sprintf for specific format strings */
-static void my_sprintf(char *dest, const char *fmt, const char *s1, const char *s2)
-{
-    while (*fmt)
-    {
-        if (*fmt == '%' && *(fmt + 1) == 's')
-        {
-            const char *src = s1;
-            while (*src)
-                *dest++ = *src++;
-            s1 = s2;
-            fmt += 2;
-        }
-        else
-        {
-            *dest++ = *fmt++;
-        }
-    }
-    *dest = '\0';
-}
-
-/* Simple delay function */
-static void delay_ms(int ms)
-{
-    int i, j;
-    for (i = 0; i < ms; i++)
-        for (j = 0; j < 100; j++)
-            ;
-}
-
 /* Idle task to keep ticks advancing when all other tasks are sleeping. */
 static void idle_task(void *arg)
 {
@@ -134,42 +85,6 @@ static void idle_task(void *arg)
         scheduler_yield();
     }
 }
-
-/* Heuristic: treat value as string if it is non-NULL, null-terminated within a
-   small bound, and all chars are printable or whitespace. */
-static bool is_likely_string(const void *ptr)
-{
-    const char *s = (const char *)ptr;
-    size_t i;
-
-    if (!s)
-        return false;
-
-    for (i = 0; i < 128; i++) {
-        unsigned char c = (unsigned char)s[i];
-        if (c == '\0')
-            return i > 0; /* found terminator within bound */
-        if (!(isprint(c) || isspace(c)))
-            return false;
-    }
-
-    return false; /* no terminator within bound */
-}
-
-
-#if USE_PUBSUB_BTREE_ONLY == 1
-/* Separate B-tree instance for test items */
-static BTree *g_test_btree = NULL;
-#endif
-
-/* ========== Test Producer/Validator Tasks for BTree ========== */
-
-#if USE_PUBSUB_BTREE_ONLY == 1
-#define TEST_ITEM_COUNT 300
-#define NUM_PRODUCERS 2
-#define NUM_CONSUMERS 2
-#define JSON_ITEM_COUNT 125   /* Number of items with JSON data */
-#define MAX_JSON_SIZE 64    /* Max size for JSON strings */
 
 /* Test item data structure - holds both numeric and JSON data */
 struct TestItem {
@@ -204,6 +119,7 @@ static unsigned char timing_first_produced_recorded = 0;
 static unsigned char timing_all_produced_recorded = 0;
 static unsigned char timing_all_consumed_recorded = 0;
 static unsigned char timing_validation_recorded = 0;
+
 /* Initialize producer tracking arrays */
 static void init_producer_tracking(void) {
     int i;
@@ -607,58 +523,6 @@ static void test_cleanup_task(void *arg)
 }
 #endif
 
-/* Bridge task that polls MQTT and publishes to pubsub */
-static void mqtt_to_pubsub_bridge(void *arg)
-{
-    static unsigned int msg_len;
-    static unsigned int payload_len;
-    PubSubMessage pub_msg;
-    
-    (void)arg;
-    
-    printf("[BRIDGE] Starting MQTT to PubSub bridge task\n");
-    
-    for (;;) {
-        /* Poll for MQTT messages */
-        RIA.op = 0x35;  /* mq_poll */
-        while (RIA.busy) { }
-        
-        msg_len = RIA.a | (RIA.x << 8);
-        
-        if (msg_len > 0) {
-            printf("[BRIDGE] MQTT message received (%u bytes)\n", msg_len);
-            
-            /* Read the actual message to consume it from the MQTT queue */
-            /* Set up buffer at 0x0600 for message payload */
-            RIA.xstack = 0x0600 >> 8;    /* payload addr high */
-            RIA.xstack = 0x0600 & 0xFF;  /* payload addr low */
-            RIA.xstack = 255 >> 8;       /* buffer size high */
-            RIA.xstack = 255 & 0xFF;     /* buffer size low */
-            
-            RIA.op = 0x36;  /* mq_read_message - THIS CONSUMES THE MESSAGE */
-            while (RIA.busy) { }
-            
-            payload_len = RIA.a | (RIA.x << 8);
-            printf("[BRIDGE] Read message: %u bytes from MQTT\n", payload_len);
-            
-            /* Create key/value message: key=0, value=payload length cast to pointer */
-            pub_msg.key = 0;
-            pub_msg.value = (void *)(unsigned long)payload_len;
-            
-            /* Publish to pubsub system */
-            if (pubsub_publish(&g_pubsub_mgr, "rp6502_sub", &pub_msg)) {
-                printf("[BRIDGE] Published key=0, value=%u to 'rp6502_sub' topic\n", payload_len);
-            } else {
-                printf("[BRIDGE] FAILED to publish to pubsub (queue full?)\n");
-            }
-            
-            /* Keep polling to see if there are more messages queued */
-        } else {
-            /* No message, sleep to avoid busy-polling */
-            scheduler_sleep(100);
-        }
-    }
-}
 
 static void pubsub_monitor(void *arg)
 {
@@ -694,79 +558,6 @@ static void pubsub_monitor(void *arg)
 
         /* Reduced sleep to ensure frequent message processing */
         scheduler_sleep(50);
-    }
-}
-
-static void pubsub_mqtt_monitor(void *arg)
-{
-    static unsigned int empty_count = 0;
-    static const unsigned int EMPTY_THRESHOLD = 10;
-    unsigned int queue_size;
-    
-    (void)arg;
-    
-    printf("[MONITOR] Starting pubsub monitor task\n");
-    
-    for (;;) {
-        pubsub_process_all(&g_pubsub_mgr);
-        
-        queue_size = pubsub_queue_size(&g_pubsub_mgr, "rp6502_sub");
-        printf("[MONITOR] Queue sizes: rp6502_sub=%u\n", queue_size);
-        
-        /* Track empty cycles */
-        if (queue_size == 0) {
-            empty_count++;
-            
-            if (empty_count >= EMPTY_THRESHOLD) {
-                printf("[MONITOR] Queue empty for %u cycles. Exiting monitor task.\n", empty_count);
-                break;
-            }
-        } else {
-            empty_count = 0;  /* Reset counter if queue has messages */
-        }
-        
-        scheduler_sleep(300);
-    }
-    
-    printf("[MONITOR] Monitor task completed\n");
-}
-
-static void pubsub_publish_task(void *arg)
-{
-    static char json_buffer[128];
-    PubSubMessage msg;
-    
-    (void)arg;
-    
-    printf("[MONITOR] Starting pubsub publish task\n");
-    
-    for (;;) {
-        /* Check if validation is complete */
-        if (test_validation_complete) {
-            printf("[PUBLISH_TASK] Validation complete, exiting publish task\n");
-            break;
-        }
-        
-        /* Publish to rp6502_pub_1 */
-        msg = pubsub_make_message(1, (void *)(unsigned long)_count1);
-        pubsub_publish(&g_pubsub_mgr, "rp6502_pub_1", &msg);
-        scheduler_sleep(100);
-        
-        /* Publish to rp6502_pub_2 */
-        msg = pubsub_make_message(2, (void *)(unsigned long)_count2);
-        pubsub_publish(&g_pubsub_mgr, "rp6502_pub_2", &msg);
-        scheduler_sleep(200);
-        
-        /* Publish JSON string to rp6502_pub_3 */
-        snprintf(json_buffer, sizeof(json_buffer), 
-                 "{\"count\":%u,\"status\":\"active\"}", _count3);
-        msg = pubsub_make_message(3, json_buffer);
-        pubsub_publish(&g_pubsub_mgr, "rp6502_pub_3", &msg);
-
-        _count1++;
-        _count2++;
-        _count3++;
-        scheduler_sleep(300);
     }
 }
 
